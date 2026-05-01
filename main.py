@@ -1,304 +1,297 @@
-"""
-Serviço Python — custom_floorplan_detect
-========================================
-
-FastAPI + OpenCV avançado. Recebe uma imagem por multipart/form-data
-(campo `file`) e devolve detections no contrato:
-
-{
-  "walls":   [ { "x1","y1","x2","y2","thickness","confidence" } ],
-  "doors":   [],
-  "windows": [],
-  "rooms":   [],
-  "confidence": float,
-  "preview_image": "data:image/png;base64,...",   # opcional
-  "warnings": [ ... ],
-  "width": int, "height": int
-}
-
-Pipeline:
-  1. Decodifica imagem.
-  2. Tenta corrigir perspectiva (maior contorno quadrilátero ~ folha A4).
-  3. Separa canal de paredes (preto) e marcações (vermelho) por HSV.
-  4. Remove textos / blobs pequenos (componentes conectados).
-  5. Canny + HoughLinesP.
-  6. Snap horizontal/vertical, agrupa próximos, mescla colineares.
-  7. Devolve walls com x1,y1,x2,y2,thickness,confidence.
-
-NÃO inventa rooms/doors. windows = []. doors = []. rooms = [].
-A normalização final / SVG é responsabilidade do frontend
-(provider custom_floorplan_ai → detectionsToFloorPlanResult).
-
-Rodar local:
-  pip install -r requirements.txt
-  uvicorn main:app --host 0.0.0.0 --port 8000
-
-Deploy: Fly.io, Render, Railway, Cloud Run — qualquer host com Python 3.11.
-Depois cole a URL pública no secret CUSTOM_FLOORPLAN_PY_URL do projeto Lovable.
-"""
-
-from __future__ import annotations
-
+import os
+import uuid
 import base64
-import io
-import math
-from typing import List, Tuple
+from typing import List, Dict, Any
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from supabase import create_client
 
-app = FastAPI(title="custom_floorplan_detect", version="0.1.0")
+
+app = FastAPI(title="PlanScan Python Engine")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST", "OPTIONS"],
+    allow_credentials=True,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 
-# ---------- Utilidades geométricas ----------
-
-def _order_quad(pts: np.ndarray) -> np.ndarray:
-    """Ordena 4 pontos em TL, TR, BR, BL."""
-    rect = np.zeros((4, 2), dtype=np.float32)
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1).ravel()
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-def _try_perspective(img: np.ndarray) -> Tuple[np.ndarray, bool]:
-    """Tenta endireitar a folha. Retorna (img, foi_corrigida)."""
-    h, w = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return img, False
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
-    page_area = w * h
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4 and cv2.contourArea(c) > page_area * 0.25:
-            quad = _order_quad(approx.reshape(4, 2).astype(np.float32))
-            (tl, tr, br, bl) = quad
-            wA = np.linalg.norm(br - bl)
-            wB = np.linalg.norm(tr - tl)
-            hA = np.linalg.norm(tr - br)
-            hB = np.linalg.norm(tl - bl)
-            maxW = int(max(wA, wB))
-            maxH = int(max(hA, hB))
-            if maxW < 100 or maxH < 100:
-                return img, False
-            dst = np.array([[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]], dtype=np.float32)
-            M = cv2.getPerspectiveTransform(quad, dst)
-            warped = cv2.warpPerspective(img, M, (maxW, maxH))
-            return warped, True
-    return img, False
+@app.get("/")
+def home():
+    return {"ok": True, "service": "PlanScan Python Engine"}
 
-
-# ---------- Máscaras de cor ----------
-
-def _mask_black_walls(img: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Adaptive — robusto a sombra e iluminação irregular.
-    th = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 10
-    )
-    # Remove ruído pequeno (textos, pontilhado, cotas).
-    th = _remove_small_blobs(th, min_area=80)
-    # Fecha cantos.
-    kernel = np.ones((3, 3), np.uint8)
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return th
-
-
-def _mask_red(img: np.ndarray) -> np.ndarray:
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    m1 = cv2.inRange(hsv, (0, 70, 50), (10, 255, 255))
-    m2 = cv2.inRange(hsv, (170, 70, 50), (180, 255, 255))
-    return cv2.bitwise_or(m1, m2)
-
-
-def _remove_small_blobs(mask: np.ndarray, min_area: int = 50) -> np.ndarray:
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    out = np.zeros_like(mask)
-    for i in range(1, n):
-        if stats[i, cv2.CC_STAT_AREA] >= min_area:
-            out[labels == i] = 255
-    return out
-
-
-# ---------- Hough + limpeza geométrica ----------
-
-def _hough_segments(mask: np.ndarray) -> List[Tuple[int, int, int, int]]:
-    edges = cv2.Canny(mask, 50, 150)
-    lines = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=60,
-        minLineLength=30,
-        maxLineGap=10,
-    )
-    if lines is None:
-        return []
-    return [tuple(int(v) for v in l[0]) for l in lines]
-
-
-def _snap_h_v(seg, tol_deg: float = 7.0):
-    x1, y1, x2, y2 = seg
-    ang = math.degrees(math.atan2(y2 - y1, x2 - x1))
-    a = abs(ang) % 180
-    if a < tol_deg or a > 180 - tol_deg:
-        y = (y1 + y2) // 2
-        return (x1, y, x2, y)
-    if abs(a - 90) < tol_deg:
-        x = (x1 + x2) // 2
-        return (x, y1, x, y2)
-    return None  # diagonal — descarta
-
-
-def _length(s):
-    return math.hypot(s[2] - s[0], s[3] - s[1])
-
-
-def _merge_collinear(segs, gap=8, tol=4):
-    """Mescla segmentos colineares próximos (mesma orientação H/V)."""
-    horiz = [s for s in segs if s[1] == s[3]]
-    vert = [s for s in segs if s[0] == s[2]]
-
-    def merge_axis(items, axis_idx):
-        # axis_idx 0 = vertical (mesmo x), agrupa por x; 1 = horizontal, agrupa por y
-        items = sorted(items, key=lambda s: (s[axis_idx], min(s[0], s[2]), min(s[1], s[3])))
-        merged = []
-        for s in items:
-            placed = False
-            for i, m in enumerate(merged):
-                if abs(s[axis_idx] - m[axis_idx]) <= tol:
-                    if axis_idx == 1:  # horizontal: y igual, intervalo em x
-                        a1, a2 = sorted([m[0], m[2]])
-                        b1, b2 = sorted([s[0], s[2]])
-                        if b1 <= a2 + gap and a1 <= b2 + gap:
-                            new_y = (m[axis_idx] + s[axis_idx]) // 2
-                            merged[i] = (min(a1, b1), new_y, max(a2, b2), new_y)
-                            placed = True
-                            break
-                    else:  # vertical
-                        a1, a2 = sorted([m[1], m[3]])
-                        b1, b2 = sorted([s[1], s[3]])
-                        if b1 <= a2 + gap and a1 <= b2 + gap:
-                            new_x = (m[axis_idx] + s[axis_idx]) // 2
-                            merged[i] = (new_x, min(a1, b1), new_x, max(a2, b2))
-                            placed = True
-                            break
-            if not placed:
-                merged.append(s)
-        return merged
-
-    return merge_axis(horiz, 1) + merge_axis(vert, 0)
-
-
-def _estimate_thickness(mask: np.ndarray, seg) -> int:
-    """Estima espessura amostrando a normal da linha."""
-    x1, y1, x2, y2 = seg
-    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-    if y1 == y2:  # horizontal → mede vertical
-        col = mask[max(0, cy - 20): cy + 20, cx]
-    else:  # vertical → mede horizontal
-        col = mask[cy, max(0, cx - 20): cx + 20]
-    on = int(np.sum(col > 0))
-    return max(1, on)
-
-
-# ---------- Endpoint ----------
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
+def image_to_base64(image: np.ndarray) -> str:
+    _, buffer = cv2.imencode(".png", image)
+    return "data:image/png;base64," + base64.b64encode(buffer).decode("utf-8")
+
+
+def normalize_line(x1, y1, x2, y2):
+    dx = abs(x2 - x1)
+    dy = abs(y2 - y1)
+
+    if dx >= dy:
+        y = int((y1 + y2) / 2)
+        return {
+            "id": f"wall_{uuid.uuid4().hex[:8]}",
+            "x1": int(min(x1, x2)),
+            "y1": y,
+            "x2": int(max(x1, x2)),
+            "y2": y,
+            "orientation": "horizontal",
+            "type": "wall",
+            "confidence": 0.65,
+        }
+    else:
+        x = int((x1 + x2) / 2)
+        return {
+            "id": f"wall_{uuid.uuid4().hex[:8]}",
+            "x1": x,
+            "y1": int(min(y1, y2)),
+            "x2": x,
+            "y2": int(max(y1, y2)),
+            "orientation": "vertical",
+            "type": "wall",
+            "confidence": 0.65,
+        }
+
+
+def detect_walls(image: np.ndarray) -> List[Dict[str, Any]]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    gray = cv2.equalizeHist(gray)
+
+    thresh = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        10,
+    )
+
+    kernel = np.ones((2, 2), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    edges = cv2.Canny(thresh, 50, 150)
+
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=60,
+        minLineLength=35,
+        maxLineGap=18,
+    )
+
+    walls = []
+
+    if lines is None:
+        return walls
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+
+        length = float(np.hypot(x2 - x1, y2 - y1))
+        if length < 35:
+            continue
+
+        wall = normalize_line(x1, y1, x2, y2)
+        walls.append(wall)
+
+    return walls
+
+
+def merge_walls(walls: List[Dict[str, Any]], tolerance: int = 14) -> List[Dict[str, Any]]:
+    horizontal = [w for w in walls if w["orientation"] == "horizontal"]
+    vertical = [w for w in walls if w["orientation"] == "vertical"]
+
+    merged = []
+
+    def merge_group(group, orientation):
+        used = [False] * len(group)
+        result = []
+
+        for i, wall in enumerate(group):
+            if used[i]:
+                continue
+
+            current = wall.copy()
+            used[i] = True
+
+            changed = True
+            while changed:
+                changed = False
+
+                for j, other in enumerate(group):
+                    if used[j]:
+                        continue
+
+                    if orientation == "horizontal":
+                        same_axis = abs(current["y1"] - other["y1"]) <= tolerance
+                        touching = not (
+                            other["x2"] < current["x1"] - tolerance
+                            or other["x1"] > current["x2"] + tolerance
+                        )
+
+                        if same_axis and touching:
+                            current["x1"] = min(current["x1"], other["x1"])
+                            current["x2"] = max(current["x2"], other["x2"])
+                            current["y1"] = current["y2"] = int(
+                                (current["y1"] + other["y1"]) / 2
+                            )
+                            used[j] = True
+                            changed = True
+
+                    else:
+                        same_axis = abs(current["x1"] - other["x1"]) <= tolerance
+                        touching = not (
+                            other["y2"] < current["y1"] - tolerance
+                            or other["y1"] > current["y2"] + tolerance
+                        )
+
+                        if same_axis and touching:
+                            current["y1"] = min(current["y1"], other["y1"])
+                            current["y2"] = max(current["y2"], other["y2"])
+                            current["x1"] = current["x2"] = int(
+                                (current["x1"] + other["x1"]) / 2
+                            )
+                            used[j] = True
+                            changed = True
+
+            current["id"] = f"wall_{uuid.uuid4().hex[:8]}"
+            current["confidence"] = 0.78
+            result.append(current)
+
+        return result
+
+    merged.extend(merge_group(horizontal, "horizontal"))
+    merged.extend(merge_group(vertical, "vertical"))
+
+    return merged
+
+
+def build_svg(width: int, height: int, walls: List[Dict[str, Any]]) -> str:
+    lines = []
+
+    for wall in walls:
+        lines.append(
+            f'<line x1="{wall["x1"]}" y1="{wall["y1"]}" '
+            f'x2="{wall["x2"]}" y2="{wall["y2"]}" '
+            f'stroke="#111827" stroke-width="4" stroke-linecap="square" />'
+        )
+
+    svg = f"""
+    <svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+      <rect width="100%" height="100%" fill="#ffffff"/>
+      {''.join(lines)}
+    </svg>
+    """
+
+    return svg.strip()
+
+
+def save_to_supabase(image_url: str, walls: List[Dict[str, Any]], metadata: Dict[str, Any]):
+    if not supabase:
+        return {"saved": False, "reason": "Supabase not configured"}
+
+    try:
+        result = (
+            supabase.table("training_samples")
+            .insert(
+                {
+                    "image_url": image_url,
+                    "ai_walls": walls,
+                    "metadata": metadata,
+                }
+            )
+            .execute()
+        )
+
+        return {"saved": True, "result": str(result)}
+    except Exception as e:
+        return {"saved": False, "reason": str(e)}
+
+
 @app.post("/detect")
 async def detect(file: UploadFile = File(...)):
-    raw = await file.read()
-    if not raw:
-        return JSONResponse({"error": "empty_file"}, status_code=400)
+    content = await file.read()
 
-    arr = np.frombuffer(raw, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        return JSONResponse({"error": "decode_failed"}, status_code=400)
+    np_arr = np.frombuffer(content, np.uint8)
+    image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-    warnings: List[str] = []
+    if image is None:
+        return {
+            "status": "error",
+            "message": "Imagem inválida ou não suportada",
+        }
 
-    # 1. Perspectiva
-    img2, corrected = _try_perspective(img)
-    if not corrected:
-        warnings.append("Perspectiva da folha não detectada — usando imagem original.")
+    height, width = image.shape[:2]
 
-    h, w = img2.shape[:2]
+    raw_walls = detect_walls(image)
+    clean_walls = merge_walls(raw_walls)
 
-    # 2. Máscaras
-    walls_mask = _mask_black_walls(img2)
-    red_mask = _mask_red(img2)
-    # Remove vermelho do canal de paredes (não confunde marcações com parede).
-    walls_mask = cv2.bitwise_and(walls_mask, cv2.bitwise_not(red_mask))
+    svg = build_svg(width, height, clean_walls)
 
-    # 3. Hough + snap H/V
-    raw_segs = _hough_segments(walls_mask)
-    snapped = [s for s in (_snap_h_v(s) for s in raw_segs) if s is not None]
+    confidence = 0
+    if len(raw_walls) > 0:
+        confidence = min(95, int((len(clean_walls) / max(len(raw_walls), 1)) * 100))
 
-    # 4. Filtra muito curtas
-    min_len = max(20, int(0.02 * max(w, h)))
-    snapped = [s for s in snapped if _length(s) >= min_len]
-
-    # 5. Mescla colineares
-    merged = _merge_collinear(snapped, gap=10, tol=5)
-
-    # 6. Confidence por comprimento normalizado
-    diag = math.hypot(w, h)
-    walls_out = []
-    for s in merged:
-        thick = _estimate_thickness(walls_mask, s)
-        conf = float(min(1.0, _length(s) / (diag * 0.6)))
-        walls_out.append({
-            "x1": int(s[0]), "y1": int(s[1]),
-            "x2": int(s[2]), "y2": int(s[3]),
-            "thickness": int(thick),
-            "confidence": round(conf, 3),
-        })
-
-    if not walls_out:
-        warnings.append("Nenhuma parede confiável detectada. Tente uma imagem com melhor contraste e iluminação uniforme.")
-
-    overall_conf = float(np.mean([w_["confidence"] for w_ in walls_out])) if walls_out else 0.0
-
-    # Preview anotado
-    preview = img2.copy()
-    for w_ in walls_out:
-        cv2.line(preview, (w_["x1"], w_["y1"]), (w_["x2"], w_["y2"]), (0, 0, 0), 3)
-    ok, buf = cv2.imencode(".png", preview)
-    preview_b64 = ""
-    if ok:
-        preview_b64 = "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
-
-    return {
-        "walls": walls_out,
+    response = {
+        "status": "success",
+        "provider": "custom_floorplan_ai",
+        "width": width,
+        "height": height,
+        "walls": clean_walls,
         "doors": [],
         "windows": [],
         "rooms": [],
-        "confidence": round(overall_conf, 3),
-        "preview_image": preview_b64,
-        "warnings": warnings,
-        "width": int(w),
-        "height": int(h),
+        "svg": svg,
+        "preview_image": image_to_base64(image),
+        "confidence": confidence,
+        "geometryStats": {
+            "raw_walls": len(raw_walls),
+            "clean_walls": len(clean_walls),
+            "doors": 0,
+            "windows": 0,
+            "rooms": 0,
+        },
+        "warnings": [
+            "Engine OpenCV inicial: detecta e consolida paredes, mas ainda não reconhece ambientes automaticamente."
+        ],
     }
+
+    save_result = save_to_supabase(
+        image_url=file.filename or "uploaded_image",
+        walls=clean_walls,
+        metadata={
+            "provider": "custom_floorplan_ai",
+            "width": width,
+            "height": height,
+            "raw_walls": len(raw_walls),
+            "clean_walls": len(clean_walls),
+            "confidence": confidence,
+        },
+    )
+
+    response["supabase"] = save_result
+
+    return response
